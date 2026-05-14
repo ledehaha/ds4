@@ -34,6 +34,10 @@ typedef struct {
     bool dump_tokens;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
+    const char *imatrix_dataset_path;
+    const char *imatrix_output_path;
+    int imatrix_max_prompts;
+    int imatrix_max_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -70,7 +74,7 @@ static void usage(FILE *fp) {
         "\n"
         "Invocation modes:\n"
         "  ds4\n"
-        "      Start the interactive chat prompt: ds4>\n"
+        "      Start the interactive chat prompt with a session backend: ds4>\n"
         "  ds4 -p TEXT\n"
         "      Run one prompt and exit.\n"
         "  ds4 --prompt-file FILE\n"
@@ -88,15 +92,23 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path and the default.\n"
+        "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
+        "  --cuda\n"
+        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal or cpu. Default: metal\n"
+        "      Select backend explicitly: metal, cuda, or cpu.\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --dir-steering-file FILE\n"
+        "      Load one f32 direction vector per layer for directional steering.\n"
+        "  --dir-steering-ffn F\n"
+        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "  --dir-steering-attn F\n"
+        "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -140,11 +152,19 @@ static void usage(FILE *fp) {
         "  --inspect\n"
         "      Load the model and print a summary only.\n"
         "  --dump-tokens\n"
-        "      Print the encoded chat prompt tokens.\n"
+        "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
         "  --dump-logprobs FILE\n"
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
         "      Number of local alternatives stored by --dump-logprobs. Default: 20\n"
+        "  --imatrix-dataset FILE\n"
+        "      Rendered DS4 prompt dataset produced by misc/imatrix_dataset.\n"
+        "  --imatrix-out FILE\n"
+        "      Collect a routed-MoE activation imatrix and write llama-compatible .dat.\n"
+        "  --imatrix-max-prompts N\n"
+        "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
+        "  --imatrix-max-tokens N\n"
+        "      Stop imatrix collection after N prompt tokens. Default: no token limit\n"
         "  --head-test\n"
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
@@ -162,7 +182,8 @@ static void usage(FILE *fp) {
         "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
         "\n"
         "Notes:\n"
-        "  The CLI keeps KV cache state across interactive turns on the Metal backend.\n"
+        "  The CLI keeps KV cache state across interactive turns on session backends.\n"
+        "  CPU mode supports interactive chat too, but it is a slow reference/debug path.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
@@ -202,10 +223,21 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
     exit(2);
+}
+
+static ds4_backend default_backend(void) {
+#ifdef DS4_NO_GPU
+    return DS4_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
@@ -427,7 +459,7 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: sampled CLI generation requires the Metal session backend\n");
+        fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
 
@@ -600,7 +632,7 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --dump-logprobs requires the Metal session backend\n");
+        fprintf(stderr, "ds4: --dump-logprobs requires a graph session backend\n");
         return 1;
     }
 
@@ -833,7 +865,7 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) {
-        fprintf(stderr, "ds4: interactive chat KV cache requires the Metal backend\n");
+        fprintf(stderr, "ds4: interactive chat KV cache requires a session backend\n");
         return 1;
     }
     if (chat->session) ds4_session_free(chat->session);
@@ -1155,7 +1187,7 @@ static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
-            .backend = DS4_BACKEND_METAL,
+            .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -1171,6 +1203,7 @@ static cli_config parse_options(int argc, char **argv) {
         },
     };
 
+    bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1211,6 +1244,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--dir-steering-file")) {
+            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn")) {
+            c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-attn")) {
+            c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1219,12 +1260,23 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-dataset")) {
+            c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--imatrix-out")) {
+            c.gen.imatrix_output_path = need_arg(&i, argc, argv, arg);
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--imatrix-max-prompts")) {
+            c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-max-tokens")) {
+            c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1261,11 +1313,35 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
+        c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
+        fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
+        exit(2);
+    }
+    if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
+        fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        exit(2);
+    }
+
     return c;
 }
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.gen.dump_tokens) {
+        if (cfg.gen.prompt == NULL) {
+            fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
+                                            cfg.gen.prompt,
+                                            stdout);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
@@ -1278,6 +1354,13 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (cfg.inspect) {
         ds4_engine_summary(engine);
+    } else if (cfg.gen.imatrix_output_path) {
+        rc = ds4_engine_collect_imatrix(engine,
+                                        cfg.gen.imatrix_dataset_path,
+                                        cfg.gen.imatrix_output_path,
+                                        cfg.gen.ctx_size,
+                                        cfg.gen.imatrix_max_prompts,
+                                        cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {
