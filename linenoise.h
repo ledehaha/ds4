@@ -44,10 +44,17 @@ extern "C" {
 #endif
 
 #include <stddef.h> /* For size_t. */
+#include <stdint.h>
 
 extern char *linenoiseEditMore;
 
 #define LINENOISE_MAX_FOLDS 16
+
+struct linenoiseState;
+typedef int(linenoiseLayoutCallback)(struct linenoiseState *l,
+                                     size_t prompt_rows,
+                                     size_t status_rows,
+                                     void *privdata);
 
 /* The linenoiseState structure represents the state during line editing.
  * We pass this state to functions implementing specific editing
@@ -68,11 +75,28 @@ struct linenoiseState {
     size_t len;         /* Current edited line length. */
     size_t cols;        /* Number of columns in terminal. */
     size_t oldrows;     /* Rows used by last refreshed line (multiline mode) */
+    size_t oldstatusrows; /* Extra status rows used by last refresh. */
     int oldrpos;        /* Cursor row from last refresh (for multiline clearing). */
     int history_index;  /* The history index we are currently editing. */
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
     size_t fold_end[LINENOISE_MAX_FOLDS];   /* Folded range end offsets. */
+    char *status;       /* Optional status/footer rendered below the prompt. */
+    char *status_start; /* Optional escape sequence emitted before status. */
+    char *status_end;   /* Optional escape sequence emitted after status. */
+    linenoiseLayoutCallback *layout_callback; /* Called before refresh writes. */
+    void *layout_privdata;
+    int screen_cursor_row; /* Absolute terminal cursor row after last refresh. */
+    int screen_cursor_col; /* Absolute terminal cursor col after last refresh. */
+    char *queued_input; /* Bytes already read by an outer event loop. */
+    size_t queued_input_len;
+    size_t queued_input_pos;
+    size_t queued_input_cap;
+    char pending_key[32]; /* Incomplete UTF-8 or escape sequence. */
+    size_t pending_key_len;
+    char *paste_buf;
+    size_t paste_len, paste_cap, paste_match;
+    int paste_active, paste_overflowed;
 };
 
 typedef struct linenoiseCompletions {
@@ -83,9 +107,27 @@ typedef struct linenoiseCompletions {
 /* Non blocking API. */
 int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, char *buf, size_t buflen, const char *prompt);
 char *linenoiseEditFeed(struct linenoiseState *l);
+char *linenoiseEditFeedByte(struct linenoiseState *l, char c);
+int linenoiseEditQueueInput(struct linenoiseState *l, const char *buf, size_t len);
+size_t linenoiseEditQueuedInput(struct linenoiseState *l);
+void linenoiseEditClear(struct linenoiseState *l);
+int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
+                           const char *start_escape, const char *end_escape);
+void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
+                                    linenoiseLayoutCallback *fn,
+                                    void *privdata);
 void linenoiseEditStop(struct linenoiseState *l);
 void linenoiseHide(struct linenoiseState *l);
 void linenoiseShow(struct linenoiseState *l);
+/* UI-thread-only buffered updates; nested updates share one terminal frame. */
+void linenoiseBeginUpdate(int fd);
+void linenoiseEndUpdate(void);
+int linenoiseWrite(int fd, const char *text, size_t len);
+/* Repaint only the footer if its geometry and absolute cursor are known. */
+int linenoiseRefreshStatus(struct linenoiseState *l);
+size_t linenoiseUtf8Decode(const char *text, size_t len, uint32_t *cp);
+int linenoiseCharacterWidth(uint32_t cp);
+size_t linenoiseNextGrapheme(const char *text, size_t len, int *width);
 
 /* Blocking API. */
 char *linenoise(const char *prompt);
@@ -112,6 +154,8 @@ void linenoiseSetMultiLine(int ml);
 void linenoisePrintKeyCodes(void);
 void linenoiseMaskModeEnable(void);
 void linenoiseMaskModeDisable(void);
+/* Re-enable raw mode if a child process changed the terminal state. */
+void linenoiseRestoreRawMode(void);
 
 #ifdef __cplusplus
 }
